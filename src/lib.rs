@@ -1,19 +1,13 @@
-use async_stream::stream;
+use bytes::{Buf, BufMut, BytesMut};
 use dlt_core::{
     dlt,
     parse::{dlt_message, DltParseError, ParsedMessage},
 };
-use futures::Stream;
-use std::{
-    io,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use futures::{Sink, Stream};
+use std::io;
 use thiserror::Error;
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::TcpStream,
-};
+use tokio::net::TcpStream;
+use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -30,91 +24,97 @@ pub struct DltTcpClientOptions {
     pub port: u16,
 }
 
-pub struct DltTcpClient {}
+pub struct DltTcpClient {
+    tcp_stream: TcpStream,
+}
 
 impl DltTcpClient {
-    pub async fn connect_stream(opts: &DltTcpClientOptions) -> Result<DltStream, Error> {
-        let tcp = TcpStream::connect((&*opts.host, opts.port)).await?;
-        Ok(DltStream { tcp })
+    pub async fn connect(opts: &DltTcpClientOptions) -> Result<Self, Error> {
+        let tcp_stream = TcpStream::connect((&*opts.host, opts.port)).await?;
+        Ok(DltTcpClient { tcp_stream })
     }
 
-    pub async fn read(
-        opts: &DltTcpClientOptions,
-    ) -> Result<impl Stream<Item = Result<dlt::Message, Error>>, Error> {
-        let stream = TcpStream::connect((&*opts.host, opts.port)).await?;
-        stream.readable().await?;
+    pub fn read(self) -> impl Stream<Item = Result<dlt::Message, Error>> {
+        FramedRead::new(self.tcp_stream, DltDecoder {})
+    }
 
-        let mut buf = [0; 4096];
+    pub fn write(self) -> impl Sink<dlt::Message, Error = std::io::Error> {
+        FramedWrite::new(self.tcp_stream, DltEncoder {})
+    }
+}
 
-        let s = stream! {
-            loop {
-                match stream.try_read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        println!("read {} bytes", n);
-                        match dlt_message(&buf, None, false) {
-                            Err(e) => yield Err(e.into()),
-                            Ok((_, ParsedMessage::Item(message))) => yield Ok(message),
-                            Ok((_, ParsedMessage::Invalid)) => yield Err(Error::DltInvalidMessage),
-                            Ok((_, ParsedMessage::FilteredOut(_))) => continue,
-                        }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        continue;
-                    }
-                    Err(e) => {
-                        yield Err(e.into());
-                    }
-                }
+struct DltDecoder {}
+
+const MAX: usize = 8 * 1024 * 1024;
+
+impl Decoder for DltDecoder {
+    type Item = dlt::Message;
+    type Error = Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Header Type 1 byte + Message Counter 1 byte + Length 2 byte
+        if src.len() < 4 {
+            // Not enough data to read length marker.
+            return Ok(None);
+        }
+
+        // Read length marker.
+        let mut length_bytes = [0u8; 2];
+        length_bytes.copy_from_slice(&src[2..=3]);
+        let length = u16::from_be_bytes(length_bytes) as usize;
+
+        // Check that the length is not too large to avoid a denial of
+        // service attack where the server runs out of memory.
+        if length > MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Frame of length {} is too large.", length),
+            )
+            .into());
+        }
+
+        if src.len() < length {
+            // The full string has not yet arrived.
+            //
+            // We reserve more space in the buffer. This is not strictly
+            // necessary, but is a good idea performance-wise.
+            src.reserve(length - src.len());
+
+            // We inform the Framed that we need more bytes to form the next
+            // frame.
+            return Ok(None);
+        }
+
+        // Use advance to modify src such that it no longer contains
+        // this frame.
+        let data = src[..length].to_vec();
+        src.advance(length);
+
+        match dlt_message(&data, None, false) {
+            Err(e) => Err(e.into()),
+            Ok((_, ParsedMessage::Item(message))) => Ok(Some(message)),
+            Ok((_, ParsedMessage::Invalid)) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid DLT message data",
+            )
+            .into()),
+            // This should not occur
+            Ok((_, ParsedMessage::FilteredOut(_))) => {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Filtered message").into())
             }
-        };
-
-        Ok(s)
-    }
-}
-
-pub struct DltStream {
-    tcp: TcpStream,
-}
-
-impl AsyncRead for DltStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &mut ReadBuf,
-    ) -> Poll<std::io::Result<()>> {
-        match Pin::get_mut(self) {
-            DltStream { tcp } => Pin::new(tcp).poll_read(cx, buf),
         }
     }
 }
 
-impl AsyncWrite for DltStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &[u8],
-    ) -> Poll<std::result::Result<usize, tokio::io::Error>> {
-        match Pin::get_mut(self) {
-            DltStream { tcp } => Pin::new(tcp).poll_write(cx, buf),
-        }
-    }
+struct DltEncoder {}
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-    ) -> Poll<std::result::Result<(), tokio::io::Error>> {
-        match Pin::get_mut(self) {
-            DltStream { tcp } => Pin::new(tcp).poll_flush(cx),
-        }
-    }
+impl Encoder<dlt::Message> for DltEncoder {
+    type Error = io::Error;
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context,
-    ) -> Poll<std::result::Result<(), tokio::io::Error>> {
-        match Pin::get_mut(self) {
-            DltStream { tcp } => Pin::new(tcp).poll_shutdown(cx),
-        }
+    fn encode(&mut self, item: dlt::Message, dst: &mut BytesMut) -> io::Result<()> {
+        let item_bytes = item.as_bytes();
+        dst.reserve(item_bytes.len());
+        dst.put(&*item_bytes);
+        Ok(())
     }
 }

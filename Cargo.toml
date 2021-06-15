@@ -8,7 +8,9 @@ edition = "2018"
 
 [dependencies]
 async-stream = "0.3"
+bytes = "1.0"
 dlt-core = "0.9"
 thiserror = "1.0"
 futures = "0.3"
 tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.6", features = ["codec"] }
